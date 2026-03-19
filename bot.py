@@ -7,7 +7,9 @@ from openai import AsyncOpenAI
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from pptx import Presentation
-from pptx.util import Pt
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
 
 load_dotenv()
 
@@ -29,13 +31,111 @@ SYSTEM_PROMPT = """
 - Используй ТОЛЬКО то, что сказал пользователь. Не додумывай ничего лишнего.
 - Каждый слайд: # Заголовок слайда + 3-5 коротких буллетов
 - Максимум 10 слайдов
-- Первый слайд — титульный с темой и подзаголовком
+- Первый слайд — титульный (только # заголовок, без буллетов)
 - Последний слайд — ключевые выводы
 
 Формат вывода — чистый Markdown, ничего лишнего.
 """
 
 transcripts = {}
+
+
+def add_text_box(slide, text, left, top, width, height,
+                 font_size=18, bold=False, color=(255, 255, 255),
+                 align=PP_ALIGN.LEFT):
+    """Добавляет текстовый блок на слайд с заданными параметрами."""
+    txBox = slide.shapes.add_textbox(
+        Inches(left), Inches(top), Inches(width), Inches(height)
+    )
+    tf = txBox.text_frame
+    tf.word_wrap = True
+
+    # Первый параграф
+    p = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = text
+    run.font.size = Pt(font_size)
+    run.font.bold = bold
+    run.font.color.rgb = RGBColor(*color)
+    return txBox
+
+
+def build_pptx(md_content: str, output_path: str):
+    prs = Presentation(TEMPLATE_PATH)
+
+    # Слайд 10x5.62 inches (из шаблона)
+    # Зоны контента: заголовок вверху слева, тело под ним
+    TITLE_LEFT   = 1.38
+    TITLE_TOP    = 0.16
+    TITLE_WIDTH  = 7.50
+    TITLE_HEIGHT = 0.45
+
+    BODY_LEFT    = 1.38
+    BODY_TOP     = 0.80
+    BODY_WIDTH   = 7.50
+    BODY_HEIGHT  = 4.50
+
+    current_title = None
+    current_bullets = []
+    is_first_slide = True
+
+    def flush_slide():
+        nonlocal is_first_slide
+        if current_title is None:
+            return
+
+        # Выбираем лейаут: 0=TITLE для первого слайда, 2=TITLE_AND_TWO_COLUMNS для остальных
+        layout_idx = 0 if is_first_slide else 2
+        layout = prs.slide_layouts[layout_idx]
+        slide = prs.slides.add_slide(layout)
+        is_first_slide = False
+
+        # Пишем заголовок в placeholder idx=0
+        for ph in slide.placeholders:
+            if ph.placeholder_format.idx == 0:
+                ph.text = current_title
+                for para in ph.text_frame.paragraphs:
+                    for run in para.runs:
+                        run.font.size = Pt(16)
+                        run.font.bold = True
+                break
+
+        # Пишем буллеты как textbox в зоне тела
+        if current_bullets:
+            txBox = slide.shapes.add_textbox(
+                Inches(BODY_LEFT), Inches(BODY_TOP),
+                Inches(BODY_WIDTH), Inches(BODY_HEIGHT)
+            )
+            tf = txBox.text_frame
+            tf.word_wrap = True
+
+            for i, bullet in enumerate(current_bullets):
+                if i == 0:
+                    p = tf.paragraphs[0]
+                else:
+                    p = tf.add_paragraph()
+                p.alignment = PP_ALIGN.LEFT
+                p.space_before = Pt(6)
+                run = p.add_run()
+                run.text = f"• {bullet}"
+                run.font.size = Pt(14)
+                run.font.color.rgb = RGBColor(255, 255, 255)
+
+    for line in md_content.splitlines():
+        line = line.strip()
+        if line.startswith("# ") or line.startswith("## "):
+            flush_slide()
+            current_title = line.lstrip("#").strip()
+            current_bullets = []
+        elif line.startswith(("- ", "* ", "• ")):
+            current_bullets.append(line[2:].strip())
+        elif line and not line.startswith("#") and current_title and not current_bullets:
+            # Подзаголовок на титульном слайде
+            current_bullets.append(line)
+
+    flush_slide()
+    prs.save(output_path)
 
 
 @dp.message(CommandStart())
@@ -70,51 +170,6 @@ async def handle_voice(message: Message):
         f"✅ Записал:\n\n_{text}_\n\nОтправь ещё войс или /build",
         parse_mode="Markdown"
     )
-
-
-def build_pptx(md_content: str, output_path: str):
-    prs = Presentation(TEMPLATE_PATH)  # ← берём лейауты из шаблона
-
-    current_title = None
-    current_bullets = []
-    is_first_slide = True
-
-    def flush_slide():
-        nonlocal is_first_slide
-        if current_title is None:
-            return
-        # Первый слайд — титульный (layout 0), остальные — контентные (layout 1)
-        layout_index = 0 if is_first_slide else 1
-        layout = prs.slide_layouts[layout_index]
-        slide = prs.slides.add_slide(layout)
-        is_first_slide = False
-
-        # Заголовок
-        if slide.shapes.title:
-            slide.shapes.title.text = current_title
-
-        # Буллеты — ищем первый placeholder не-заголовок
-        if current_bullets:
-            for ph in slide.placeholders:
-                if ph.placeholder_format.idx != 0:
-                    tf = ph.text_frame
-                    tf.text = current_bullets[0]
-                    for b in current_bullets[1:]:
-                        p = tf.add_paragraph()
-                        p.text = b
-                    break
-
-    for line in md_content.splitlines():
-        line = line.strip()
-        if line.startswith("# ") or line.startswith("## "):
-            flush_slide()
-            current_title = line.lstrip("#").strip()
-            current_bullets = []
-        elif line.startswith(("- ", "* ", "• ")):
-            current_bullets.append(line[2:].strip())
-
-    flush_slide()
-    prs.save(output_path)
 
 
 @dp.message(F.text == "/build")
