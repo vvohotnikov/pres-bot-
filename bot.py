@@ -108,7 +108,7 @@ def build_pptx( dict, output_path: str):  # ← было: def build_pptx( dict, 
 
     new_title_slide = duplicate_slide(prs, TITLE_SLIDE_IDX)
     new_content_slides = []
-    for _ in slides_  # ← было: for _ in slides_
+    for _ in slides_
         new_content_slides.append(duplicate_slide(prs, CONTENT_SLIDE_IDX))
 
     set_shape_text(new_title_slide, TITLE_SHAPES["title"],    data.get('title', ''))
