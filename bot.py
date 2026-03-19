@@ -20,9 +20,9 @@ client = AsyncOpenAI(
     base_url="https://api.proxyapi.ru/openai/v1"
 )
 
-# ── Палитра шаблона ────────────────────────────────────────────────
-BG_DARK   = RGBColor(0x13, 0x11, 0x1C)
-BG_LIGHT  = RGBColor(0xEC, 0xF1, 0xF3)
+# ── Палитра ────────────────────────────────────────────────────────
+BG_BLACK  = RGBColor(0x00, 0x00, 0x00)   # титул, итоги, перебивки
+BG_LIGHT  = RGBColor(0xEC, 0xF1, 0xF3)   # контентные слайды
 CLR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 CLR_BLACK = RGBColor(0x00, 0x00, 0x00)
 CLR_GRAY  = RGBColor(0x7C, 0x7C, 0x7C)
@@ -37,7 +37,7 @@ SLIDE_W = Inches(10.0)
 SLIDE_H = Inches(5.625)
 LABEL   = "Москва 2026"
 
-# ── Системный промт (без изменений) ───────────────────────────────
+# ── Системный промт ────────────────────────────────────────────────
 SYSTEM_PROMPT = """
 Ты — ассистент для создания презентаций.
 Тебе дают расшифровку голосового сообщения.
@@ -45,10 +45,10 @@ SYSTEM_PROMPT = """
 
 Правила:
 - Используй ТОЛЬКО то, что сказал пользователь. Не додумывай ничего лишнего.
-- Каждый слайд: # Заголовок слайда + 3-5 коротких буллетов
+- Первый слайд — титульный: # Заголовок + одна строка подзаголовка буллетом
+- Контентные слайды: ## Заголовок раздела + 3-5 коротких буллетов
+- Последний слайд — итоги: ### Ключевые выводы + 3-5 буллетов
 - Максимум 10 слайдов
-- Первый слайд — титульный с темой и подзаголовком
-- Последний слайд — ключевые выводы
 
 Формат вывода — чистый Markdown, ничего лишнего.
 """
@@ -56,7 +56,7 @@ SYSTEM_PROMPT = """
 transcripts = {}
 
 
-# ── Утилиты стилизации ─────────────────────────────────────────────
+# ── Утилиты ────────────────────────────────────────────────────────
 
 def set_bg(slide, rgb: RGBColor):
     fill = slide.background.fill
@@ -86,93 +86,133 @@ def add_rect(slide, left, top, width, height, color: RGBColor):
     s.line.fill.background()
 
 
-def add_chrome(slide, slide_num: int):
-    """Шапка с датой + номер слайда — на всех слайдах."""
-    add_rect(slide, Inches(0), Inches(0), SLIDE_W, Inches(0.38), BG_DARK)
-    add_text(slide, LABEL, Inches(0.14), Inches(0.05), Inches(4), Inches(0.32),
-             size=10, color=CLR_WHITE)
+def add_chrome(slide, slide_num: int, dark: bool):
+    """Верхняя шапка: avito.tech + дата + номер слайда."""
+    bar_color = RGBColor(0x1A, 0x1A, 0x1A) if dark else RGBColor(0xD8, 0xDE, 0xE1)
+    add_rect(slide, Inches(0), Inches(0), SLIDE_W, Inches(0.38), bar_color)
+    label_color = CLR_WHITE if dark else CLR_GRAY
+    add_text(slide, "avito.tech", Inches(0.14), Inches(0.05), Inches(1.2), Inches(0.32),
+             size=10, bold=True, color=label_color)
+    add_text(slide, LABEL, Inches(1.4), Inches(0.05), Inches(2.5), Inches(0.32),
+             size=10, bold=False, color=label_color)
+    num_color = CLR_WHITE if dark else CLR_GRAY
     add_text(slide, str(slide_num),
              Inches(9.3), Inches(0.03), Inches(0.5), Inches(0.34),
-             size=13, bold=True, color=CLR_ORANGE, align=PP_ALIGN.RIGHT)
+             size=13, bold=True, color=num_color, align=PP_ALIGN.RIGHT)
 
 
-# ── Два типа слайдов ───────────────────────────────────────────────
+# ── Три типа слайдов ───────────────────────────────────────────────
 
-def make_title_slide(prs, title: str, slide_num: int):
-    """Тёмный фон, крупный заголовок, оранжевый акцент слева."""
+def make_dark_slide(prs, title: str, bullets: list, slide_num: int):
+    """
+    Чёрный фон — для титула, перебивок и итогов.
+    Белый крупный заголовок, белые буллеты, оранжевый акцент.
+    """
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    set_bg(slide, BG_DARK)
-    add_chrome(slide, slide_num)
-    # Вертикальная оранжевая полоска
-    add_rect(slide, Inches(0), Inches(0.38), Inches(0.08), Inches(5.245), CLR_ORANGE)
+    set_bg(slide, BG_BLACK)
+    add_chrome(slide, slide_num, dark=True)
+
+    # Оранжевая вертикальная полоска слева
+    add_rect(slide, Inches(0), Inches(0.38), Inches(0.06), Inches(5.245), CLR_ORANGE)
+
     # Заголовок
     add_text(slide, title,
-             Inches(0.22), Inches(1.2), Inches(9.3), Inches(2.0),
-             size=44, bold=True, color=CLR_WHITE)
+             Inches(0.2), Inches(0.65), Inches(8.5), Inches(1.6),
+             size=48, bold=True, color=CLR_WHITE)
+
+    # Буллеты (подзаголовок или тезисы итогов)
+    for i, bullet in enumerate(bullets[:5]):
+        top = Inches(2.4) + i * Inches(0.6)
+        add_text(slide, bullet,
+                 Inches(0.2), top, Inches(8.5), Inches(0.55),
+                 size=18, bold=False, color=CLR_WHITE)
 
 
 def make_content_slide(prs, title: str, bullets: list, slide_num: int):
-    """Светлый фон, заголовок, оранжевая линия, цветные маркеры у буллетов."""
+    """
+    Светло-серый фон — для контентных слайдов.
+    Чёрный заголовок, чёрные буллеты, цветные маркеры.
+    """
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     set_bg(slide, BG_LIGHT)
-    add_chrome(slide, slide_num)
+    add_chrome(slide, slide_num, dark=False)
+
     # Заголовок
     add_text(slide, title,
              Inches(0.22), Inches(0.5), Inches(9.3), Inches(0.85),
-             size=30, bold=True, color=CLR_BLACK)
-    # Линия под заголовком
+             size=32, bold=True, color=CLR_BLACK)
+
+    # Оранжевая линия-разделитель
     add_rect(slide, Inches(0.22), Inches(1.38), Inches(9.1), Inches(0.04), CLR_ORANGE)
-    # Буллеты
-    gap = Inches(0.78)
+
+    # Буллеты с цветными маркерами
     for i, bullet in enumerate(bullets[:5]):
-        top = Inches(1.55) + i * gap
+        top = Inches(1.58) + i * Inches(0.78)
         accent = ACCENT_CYCLE[i % 4]
-        # Цветной маркер
         add_rect(slide, Inches(0.22), top + Inches(0.1), Inches(0.07), Inches(0.26), accent)
-        # Текст
         add_text(slide, bullet,
                  Inches(0.38), top, Inches(9.1), Inches(0.68),
-                 size=15, bold=False, color=CLR_BLACK)
+                 size=16, bold=False, color=CLR_BLACK)
 
 
-# ── Основная функция — логика из оригинала, стиль новый ───────────
+# ── Основная функция сборки ────────────────────────────────────────
 
 def build_pptx(md_content: str, output_path: str):
     prs = Presentation()
     prs.slide_width  = SLIDE_W
     prs.slide_height = SLIDE_H
 
+    # Собираем все слайды как список (title, bullets, level)
+    # level: 1 = # (тёмный), 2 = ## (контент), 3 = ### (итоги/тёмный)
+    slides = []
     current_title   = None
     current_bullets = []
-    slide_num = [1]   # список чтобы менять из flush_slide (closure)
+    current_level   = 1
 
-    def flush_slide():
+    def flush():
         if current_title is None:
             return
-        if not current_bullets:
-            make_title_slide(prs, current_title, slide_num[0])
-        else:
-            make_content_slide(prs, current_title, current_bullets, slide_num[0])
-        slide_num[0] += 1
+        slides.append({
+            "title":   current_title,
+            "bullets": list(current_bullets),
+            "level":   current_level,
+        })
 
     for line in md_content.splitlines():
         line = line.strip()
-        if line.startswith("# "):
-            flush_slide()
+        if line.startswith("# ") and not line.startswith("## "):
+            flush()
             current_title   = line[2:].strip()
             current_bullets = []
-        elif line.startswith("## "):
-            flush_slide()
+            current_level   = 1
+        elif line.startswith("## ") and not line.startswith("### "):
+            flush()
             current_title   = line[3:].strip()
             current_bullets = []
+            current_level   = 2
+        elif line.startswith("### "):
+            flush()
+            current_title   = line[4:].strip()
+            current_bullets = []
+            current_level   = 3
         elif line.startswith(("- ", "* ", "• ")):
             current_bullets.append(line[2:].strip())
 
-    flush_slide()
+    flush()
+
+    # Рендерим слайды с правильным типом
+    for i, s in enumerate(slides):
+        num = i + 1
+        is_dark = (s["level"] in (1, 3))  # # и ### → чёрный; ## → серый
+        if is_dark:
+            make_dark_slide(prs, s["title"], s["bullets"], num)
+        else:
+            make_content_slide(prs, s["title"], s["bullets"], num)
+
     prs.save(output_path)
 
 
-# ── Telegram-хэндлеры (без изменений) ─────────────────────────────
+# ── Telegram-хэндлеры ──────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def start(message: Message):
