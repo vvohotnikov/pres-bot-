@@ -12,7 +12,10 @@ load_dotenv()
 
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher()
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = AsyncOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://api.proxyapi.ru/openai/v1"
+)
 
 # --- СИСТЕМНЫЙ ПРОМТ ---
 SYSTEM_PROMPT = """
