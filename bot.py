@@ -64,63 +64,66 @@ def add_text_box(slide, text, left, top, width, height,
 def build_pptx(md_content: str, output_path: str):
     prs = Presentation(TEMPLATE_PATH)
 
-    # Слайд 10x5.62 inches (из шаблона)
-    # Зоны контента: заголовок вверху слева, тело под ним
-    TITLE_LEFT   = 1.38
-    TITLE_TOP    = 0.16
-    TITLE_WIDTH  = 7.50
-    TITLE_HEIGHT = 0.45
+    # Нужные лейауты из шаблона:
+    # 0  = TITLE            — титульный слайд
+    # 8  = CUSTOM_8_1 (idx=15 в нашем шаблоне) — слайд с буллетами
+    # Находим по имени, чтобы не зависеть от порядка
+    layout_map = {l.name: l for l in prs.slide_layouts}
+    layout_title   = layout_map.get('TITLE')
+    layout_content = layout_map.get('CUSTOM_8_1')
 
-    BODY_LEFT    = 1.38
-    BODY_TOP     = 0.80
-    BODY_WIDTH   = 7.50
-    BODY_HEIGHT  = 4.50
+    # Удаляем все существующие слайды из шаблона (слайды 1-10)
+    # pptx не даёт удалять слайды напрямую — создаём новую презентацию с теми же лейаутами
+    prs_out = Presentation(TEMPLATE_PATH)
+    # Удаляем все слайды из output-презентации
+    from pptx.oxml.ns import qn
+    xml_slides = prs_out.slides._sldIdLst
+    for sld_id in list(xml_slides):
+        xml_slides.remove(sld_id)
 
     current_title = None
     current_bullets = []
-    is_first_slide = True
+    is_first = True
 
     def flush_slide():
-        nonlocal is_first_slide
+        nonlocal is_first
         if current_title is None:
             return
 
-        # Выбираем лейаут: 0=TITLE для первого слайда, 2=TITLE_AND_TWO_COLUMNS для остальных
-        layout_idx = 0 if is_first_slide else 2
-        layout = prs.slide_layouts[layout_idx]
-        slide = prs.slides.add_slide(layout)
-        is_first_slide = False
+        layout = layout_title if is_first else layout_content
+        slide = prs_out.slides.add_slide(layout)
+        is_first = False
 
-        # Пишем заголовок в placeholder idx=0
-        for ph in slide.placeholders:
-            if ph.placeholder_format.idx == 0:
-                ph.text = current_title
-                for para in ph.text_frame.paragraphs:
-                    for run in para.runs:
-                        run.font.size = Pt(16)
-                        run.font.bold = True
-                break
+        # Заголовок: для TITLE — большой (top=0.60), для CUSTOM_8_1 — тоже top=0.60
+        title_shape = slide.shapes.add_textbox(
+            Inches(0.19), Inches(0.58),
+            Inches(9.40), Inches(0.60)
+        )
+        tf = title_shape.text_frame
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        run = p.add_run()
+        run.text = current_title
+        run.font.size = Pt(20)
+        run.font.bold = True
+        run.font.color.rgb = RGBColor(255, 255, 255)
 
-        # Пишем буллеты как textbox в зоне тела
+        # Буллеты: начинаем строго ниже заголовка
         if current_bullets:
-            txBox = slide.shapes.add_textbox(
-                Inches(BODY_LEFT), Inches(BODY_TOP),
-                Inches(BODY_WIDTH), Inches(BODY_HEIGHT)
+            body = slide.shapes.add_textbox(
+                Inches(0.66), Inches(1.40),
+                Inches(8.80), Inches(3.80)
             )
-            tf = txBox.text_frame
-            tf.word_wrap = True
-
+            tf2 = body.text_frame
+            tf2.word_wrap = True
             for i, bullet in enumerate(current_bullets):
-                if i == 0:
-                    p = tf.paragraphs[0]
-                else:
-                    p = tf.add_paragraph()
-                p.alignment = PP_ALIGN.LEFT
-                p.space_before = Pt(6)
-                run = p.add_run()
-                run.text = f"• {bullet}"
-                run.font.size = Pt(14)
-                run.font.color.rgb = RGBColor(255, 255, 255)
+                p2 = tf2.paragraphs[0] if i == 0 else tf2.add_paragraph()
+                p2.alignment = PP_ALIGN.LEFT
+                p2.space_before = Pt(8)
+                run2 = p2.add_run()
+                run2.text = f"• {bullet}"
+                run2.font.size = Pt(14)
+                run2.font.color.rgb = RGBColor(255, 255, 255)
 
     for line in md_content.splitlines():
         line = line.strip()
@@ -130,12 +133,11 @@ def build_pptx(md_content: str, output_path: str):
             current_bullets = []
         elif line.startswith(("- ", "* ", "• ")):
             current_bullets.append(line[2:].strip())
-        elif line and not line.startswith("#") and current_title and not current_bullets:
-            # Подзаголовок на титульном слайде
+        elif line and current_title is not None and not line.startswith("#"):
             current_bullets.append(line)
 
     flush_slide()
-    prs.save(output_path)
+    prs_out.save(output_path)
 
 
 @dp.message(CommandStart())
