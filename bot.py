@@ -7,9 +7,11 @@ from openai import AsyncOpenAI
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Pt
 
 load_dotenv()
+
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.pptx")
 
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher()
@@ -18,7 +20,6 @@ client = AsyncOpenAI(
     base_url="https://api.proxyapi.ru/openai/v1"
 )
 
-# --- СИСТЕМНЫЙ ПРОМТ ---
 SYSTEM_PROMPT = """
 Ты — ассистент для создания презентаций.
 Тебе дают расшифровку голосового сообщения.
@@ -34,7 +35,9 @@ SYSTEM_PROMPT = """
 Формат вывода — чистый Markdown, ничего лишнего.
 """
 
-# --- ХЭНДЛЕРЫ ---
+transcripts = {}
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
@@ -43,8 +46,6 @@ async def start(message: Message):
         "Можешь отправить несколько войсов подряд, затем напиши /build"
     )
 
-# Хранилище транскриптов (в памяти)
-transcripts = {}
 
 @dp.message(F.voice)
 async def handle_voice(message: Message):
@@ -56,7 +57,6 @@ async def handle_voice(message: Message):
         oga_path = f"{tmp}/voice.oga"
         mp3_path = f"{tmp}/voice.mp3"
         await bot.download_file(voice_file.file_path, oga_path)
-
         AudioSegment.from_ogg(oga_path).export(mp3_path, format="mp3")
 
         with open(mp3_path, "rb") as f:
@@ -66,43 +66,49 @@ async def handle_voice(message: Message):
 
     text = result.text
     transcripts[user_id] = transcripts.get(user_id, "") + "\n\n" + text
-    await message.answer(f"✅ Записал:\n\n_{text}_\n\nОтправь ещё войс или /build", parse_mode="Markdown")
+    await message.answer(
+        f"✅ Записал:\n\n_{text}_\n\nОтправь ещё войс или /build",
+        parse_mode="Markdown"
+    )
 
 
 def build_pptx(md_content: str, output_path: str):
-    prs = Presentation()
-    prs.slide_width = Inches(13.33)
-    prs.slide_height = Inches(7.5)
+    prs = Presentation(TEMPLATE_PATH)  # ← берём лейауты из шаблона
 
     current_title = None
     current_bullets = []
+    is_first_slide = True
 
     def flush_slide():
+        nonlocal is_first_slide
         if current_title is None:
             return
-        if not current_bullets:
-            layout = prs.slide_layouts[0]
-            slide = prs.slides.add_slide(layout)
+        # Первый слайд — титульный (layout 0), остальные — контентные (layout 1)
+        layout_index = 0 if is_first_slide else 1
+        layout = prs.slide_layouts[layout_index]
+        slide = prs.slides.add_slide(layout)
+        is_first_slide = False
+
+        # Заголовок
+        if slide.shapes.title:
             slide.shapes.title.text = current_title
-        else:
-            layout = prs.slide_layouts[1]
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = current_title
-            tf = slide.placeholders[1].text_frame
-            tf.text = current_bullets[0]
-            for b in current_bullets[1:]:
-                p = tf.add_paragraph()
-                p.text = b
+
+        # Буллеты — ищем первый placeholder не-заголовок
+        if current_bullets:
+            for ph in slide.placeholders:
+                if ph.placeholder_format.idx != 0:
+                    tf = ph.text_frame
+                    tf.text = current_bullets[0]
+                    for b in current_bullets[1:]:
+                        p = tf.add_paragraph()
+                        p.text = b
+                    break
 
     for line in md_content.splitlines():
         line = line.strip()
-        if line.startswith("# "):
+        if line.startswith("# ") or line.startswith("## "):
             flush_slide()
-            current_title = line[2:].strip()
-            current_bullets = []
-        elif line.startswith("## "):
-            flush_slide()
-            current_title = line[3:].strip()
+            current_title = line.lstrip("#").strip()
             current_bullets = []
         elif line.startswith(("- ", "* ", "• ")):
             current_bullets.append(line[2:].strip())
@@ -132,7 +138,6 @@ async def build_presentation(message: Message):
     with tempfile.TemporaryDirectory() as tmp:
         pptx_path = f"{tmp}/presentation.pptx"
         build_pptx(md_content, pptx_path)
-
         await message.answer_document(
             FSInputFile(pptx_path, filename="presentation.pptx"),
             caption="🎉 Готово! Презентация на основе твоих слов."
