@@ -6,7 +6,8 @@ from aiogram.filters import CommandStart
 from openai import AsyncOpenAI
 from pydub import AudioSegment
 from dotenv import load_dotenv
-import subprocess
+from pptx import Presentation
+from pptx.util import Inches, Pt
 
 load_dotenv()
 
@@ -19,8 +20,8 @@ client = AsyncOpenAI(
 
 # --- СИСТЕМНЫЙ ПРОМТ ---
 SYSTEM_PROMPT = """
-Ты — ассистент для создания презентаций. 
-Тебе дают расшифровку голосового сообщения. 
+Ты — ассистент для создания презентаций.
+Тебе дают расшифровку голосового сообщения.
 Твоя задача — структурировать его в Markdown-презентацию.
 
 Правила:
@@ -42,7 +43,7 @@ async def start(message: Message):
         "Можешь отправить несколько войсов подряд, затем напиши /build"
     )
 
-# Хранилище транскриптов (в памяти, для прода — Redis/БД)
+# Хранилище транскриптов (в памяти)
 transcripts = {}
 
 @dp.message(F.voice)
@@ -50,26 +51,65 @@ async def handle_voice(message: Message):
     user_id = message.from_user.id
     await message.answer("⏳ Транскрибирую...")
 
-    # Скачиваем .oga файл
     voice_file = await bot.get_file(message.voice.file_id)
     with tempfile.TemporaryDirectory() as tmp:
         oga_path = f"{tmp}/voice.oga"
         mp3_path = f"{tmp}/voice.mp3"
         await bot.download_file(voice_file.file_path, oga_path)
 
-        # Конвертируем в mp3
         AudioSegment.from_ogg(oga_path).export(mp3_path, format="mp3")
 
-        # Whisper транскрипция
         with open(mp3_path, "rb") as f:
             result = await client.audio.transcriptions.create(
                 model="whisper-1", file=f, language="ru"
             )
 
     text = result.text
-    # Накапливаем транскрипты от пользователя
     transcripts[user_id] = transcripts.get(user_id, "") + "\n\n" + text
     await message.answer(f"✅ Записал:\n\n_{text}_\n\nОтправь ещё войс или /build", parse_mode="Markdown")
+
+
+def build_pptx(md_content: str, output_path: str):
+    prs = Presentation()
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    current_title = None
+    current_bullets = []
+
+    def flush_slide():
+        if current_title is None:
+            return
+        if not current_bullets:
+            layout = prs.slide_layouts[0]
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = current_title
+        else:
+            layout = prs.slide_layouts[1]
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = current_title
+            tf = slide.placeholders[1].text_frame
+            tf.text = current_bullets[0]
+            for b in current_bullets[1:]:
+                p = tf.add_paragraph()
+                p.text = b
+
+    for line in md_content.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            flush_slide()
+            current_title = line[2:].strip()
+            current_bullets = []
+        elif line.startswith("## "):
+            flush_slide()
+            current_title = line[3:].strip()
+            current_bullets = []
+        elif line.startswith(("- ", "* ", "• ")):
+            current_bullets.append(line[2:].strip())
+
+    flush_slide()
+    prs.save(output_path)
+
 
 @dp.message(F.text == "/build")
 async def build_presentation(message: Message):
@@ -80,7 +120,6 @@ async def build_presentation(message: Message):
 
     await message.answer("🔨 Собираю презентацию...")
 
-    # GPT-4o структурирует транскрипт в Markdown
     response = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -90,27 +129,17 @@ async def build_presentation(message: Message):
     )
     md_content = response.choices[0].message.content
 
-    # Конвертируем Markdown → PPTX через Pandoc с вашим шаблоном
     with tempfile.TemporaryDirectory() as tmp:
-        md_path = f"{tmp}/presentation.md"
         pptx_path = f"{tmp}/presentation.pptx"
-
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(md_content)
-
-        subprocess.run([
-            "pandoc", md_path,
-            "-o", pptx_path,
-            "--reference-doc=template.pptx"  # 👈 ваш фирменный шаблон
-        ], check=True)
+        build_pptx(md_content, pptx_path)
 
         await message.answer_document(
             FSInputFile(pptx_path, filename="presentation.pptx"),
             caption="🎉 Готово! Презентация на основе твоих слов."
         )
 
-    # Сбрасываем буфер
     del transcripts[user_id]
+
 
 async def main():
     await dp.start_polling(bot)
