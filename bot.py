@@ -1,5 +1,5 @@
 # bot.py
-import os, asyncio, tempfile
+import os, asyncio, tempfile, copy
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import CommandStart
@@ -7,9 +7,9 @@ from openai import AsyncOpenAI
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
+from pptx.util import Pt
+from pptx.oxml.ns import qn
+import json
 
 load_dotenv()
 
@@ -22,131 +22,140 @@ client = AsyncOpenAI(
     base_url="https://api.proxyapi.ru/openai/v1"
 )
 
+# Имена shapes в шаблоне (слайды 1 и 9)
+TITLE_SLIDE_IDX   = 0   # слайд 1: титульный
+CONTENT_SLIDE_IDX = 8   # слайд 9: буллеты
+
+TITLE_SHAPES = {
+    "title":    "Google Shape;227;p29",
+    "subtitle": "Google Shape;228;p29",
+    "speaker":  "Google Shape;229;p29",
+    "role":     "Google Shape;231;p29",
+    "speaker2": "Google Shape;230;p29",
+    "role2":    "Google Shape;232;p29",
+}
+CONTENT_SHAPES = {
+    "title":    "Google Shape;436;p42",
+    "subtitle": "Google Shape;437;p42",
+    "bullet0":  "Google Shape;438;p42",
+    "bullet1":  "Google Shape;439;p42",
+    "bullet2":  "Google Shape;440;p42",
+    "bullet3":  "Google Shape;441;p42",
+}
+
 SYSTEM_PROMPT = """
 Ты — ассистент для создания презентаций на русском языке.
 Тебе дают расшифровку голосового сообщения.
-Твоя задача — структурировать его в Markdown-презентацию.
+
+Верни ТОЛЬКО валидный JSON без markdown-блоков, по следующей структуре:
+{
+  "title": "Заголовок презентации",
+  "subtitle": "Одна фраза о чём презентация",
+  "speaker": "Имя спикера если упомянуто, иначе пустая строка",
+  "role": "Должность если упомянута, иначе пустая строка",
+  "slides": [
+    {
+      "title": "Заголовок слайда",
+      "subtitle": "Короткий подзаголовок или тема слайда",
+      "bullets": [
+        "Первый тезис — полное предложение 10-15 слов",
+        "Второй тезис — полное предложение 10-15 слов",
+        "Третий тезис — полное предложение 10-15 слов",
+        "Четвёртый тезис — полное предложение 10-15 слов"
+      ]
+    }
+  ]
+}
 
 Правила:
-- Используй ВСЁ, что сказал пользователь. Разворачивай каждую мысль.
-- Каждый слайд: # Заголовок + 4-6 буллетов. Каждый буллет — полное предложение 10-20 слов.
-- Буллеты содержательны: раскрывай суть, используй детали из контекста.
-- Минимум 5 слайдов, максимум 10.
-- Первый слайд: только # заголовок (тема) и ## подзаголовок (одна фраза о чём речь).
-- Последний слайд: # Ключевые выводы — 4-5 финальных тезисов.
-
-Формат — строго чистый Markdown. Никаких пояснений, только слайды.
+- Используй ВСЁ что сказал пользователь, раскрывай каждую мысль полностью
+- От 4 до 8 слайдов в "slides"
+- Ровно 4 буллета на каждый слайд
+- Последний слайд всегда "Ключевые выводы"
+- Только JSON, никаких пояснений
 """
 
 transcripts = {}
 
 
-def _clear_slides(prs: Presentation):
-    xml_slides = prs.slides._sldIdLst
-    for sld_id in list(xml_slides):
-        xml_slides.remove(sld_id)
+def set_shape_text(slide, shape_name: str, text: str):
+    """Меняет текст в shape по имени, сохраняя оригинальное форматирование."""
+    for shape in slide.shapes:
+        if shape.name == shape_name and shape.has_text_frame:
+            tf = shape.text_frame
+            for para in tf.paragraphs:
+                if para.runs:
+                    para.runs[0].text = text
+                    for run in para.runs[1:]:
+                        run.text = ''
+                    return True
+    return False
 
 
-def build_pptx(md_content: str, output_path: str):
+def duplicate_slide(prs: Presentation, slide_idx: int) -> object:
+    """
+    Дублирует слайд внутри одной Presentation.
+    Безопасно — нет cross-Presentation копирования, нет дубликатов в zip.
+    """
+    template_slide = prs.slides[slide_idx]
+    
+    # Создаём новый слайд на том же layout
+    layout = template_slide.slide_layout
+    new_slide = prs.slides.add_slide(layout)
+    
+    # Удаляем все shapes нового слайда
+    sp_tree = new_slide.shapes._spTree
+    for sp in list(sp_tree)[2:]:
+        sp_tree.remove(sp)
+    
+    # Копируем shapes из шаблонного слайда
+    for shape in template_slide.shapes:
+        sp_tree.append(copy.deepcopy(shape._element))
+    
+    return new_slide
+
+
+def build_pptx( dict, output_path: str):
     prs = Presentation(TEMPLATE_PATH)
-    layout_map = {l.name: l for l in prs.slide_layouts}
-
-    # TITLE    — красивый титульный (большой фон, без мешающих картинок)
-    # TITLE_ONLY — контентный, только фон + лого, нет перекрывающих shapes
-    layout_title   = layout_map.get("TITLE")
-    layout_content = layout_map.get("TITLE_ONLY")
-
-    prs_out = Presentation(TEMPLATE_PATH)
-    _clear_slides(prs_out)
-
-    # Слайд 10.00 x 5.62 inches
-    # Верхняя зона (лого + линия): 0 – 0.55"
-    # Безопасная зона контента: от top=0.62"
-    WHITE = (255, 255, 255)
-    GRAY  = (180, 180, 180)
-
-    current_title    = None
-    current_subtitle = None
-    current_bullets  = []
-    is_first         = True
-
-    def add_tb(slide, text, left, top, width, height,
-               size=14, bold=False, color=WHITE, align=PP_ALIGN.LEFT, wrap=True):
-        tb = slide.shapes.add_textbox(
-            Inches(left), Inches(top), Inches(width), Inches(height)
-        )
-        tf = tb.text_frame
-        tf.word_wrap = wrap
-        p = tf.paragraphs[0]
-        p.alignment = align
-        run = p.add_run()
-        run.text = text
-        run.font.size = Pt(size)
-        run.font.bold = bold
-        run.font.color.rgb = RGBColor(*color)
-        return tb
-
-    def flush_slide():
-        nonlocal is_first, current_subtitle
-        if current_title is None:
-            return
-
-        if is_first:
-            slide = prs_out.slides.add_slide(layout_title)
-            is_first = False
-            # Титульный: заголовок крупно по центру слайда
-            add_tb(slide, current_title,
-                   left=0.40, top=1.60, width=9.20, height=1.10,
-                   size=32, bold=True, color=WHITE)
-            if current_subtitle:
-                add_tb(slide, current_subtitle,
-                       left=0.40, top=2.85, width=9.20, height=0.65,
-                       size=16, bold=False, color=GRAY)
-        else:
-            slide = prs_out.slides.add_slide(layout_content)
-            # Заголовок слайда
-            add_tb(slide, current_title,
-                   left=0.40, top=0.62, width=9.20, height=0.55,
-                   size=20, bold=True, color=WHITE)
-            # Буллеты
-            if current_bullets:
-                tb = slide.shapes.add_textbox(
-                    Inches(0.40), Inches(1.30),
-                    Inches(9.20), Inches(4.05)
-                )
-                tf = tb.text_frame
-                tf.word_wrap = True
-                for i, bullet in enumerate(current_bullets):
-                    p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                    p.alignment = PP_ALIGN.LEFT
-                    p.space_before = Pt(6)
-                    run = p.add_run()
-                    run.text = f"— {bullet}"
-                    run.font.size = Pt(13)
-                    run.font.color.rgb = RGBColor(*WHITE)
-
-        current_subtitle = None
-
-    for line in md_content.splitlines():
-        line = line.strip()
-        if line.startswith("# "):
-            flush_slide()
-            current_title   = line[2:].strip()
-            current_bullets = []
-        elif line.startswith("## "):
-            if is_first and current_title is not None and current_subtitle is None:
-                current_subtitle = line[3:].strip()
-            else:
-                flush_slide()
-                current_title   = line[3:].strip()
-                current_bullets = []
-        elif line.startswith(("- ", "* ", "• ")):
-            current_bullets.append(line[2:].strip())
-        elif line and current_title is not None and not line.startswith("#"):
-            current_bullets.append(line)
-
-    flush_slide()
-    prs_out.save(output_path)
+    slides_data = data.get('slides', [])
+    
+    # Шаг 1: Дублируем нужные слайды ВНУТРИ одной презентации
+    # Сначала создаём все нужные слайды (они добавятся в конец)
+    first_content_slide = prs.slides[CONTENT_SLIDE_IDX]
+    
+    # Индексы: 0=титульный шаблон, 8=контентный шаблон
+    # Добавляем в конец: 1 титульный + N контентных
+    new_title_slide = duplicate_slide(prs, TITLE_SLIDE_IDX)
+    new_content_slides = []
+    for _ in slides_
+        new_content_slides.append(duplicate_slide(prs, CONTENT_SLIDE_IDX))
+    
+    # Шаг 2: Заполняем текст
+    set_shape_text(new_title_slide, TITLE_SHAPES["title"],    data.get('title', ''))
+    set_shape_text(new_title_slide, TITLE_SHAPES["subtitle"],  data.get('subtitle', ''))
+    set_shape_text(new_title_slide, TITLE_SHAPES["speaker"],   data.get('speaker', ''))
+    set_shape_text(new_title_slide, TITLE_SHAPES["role"],      data.get('role', ''))
+    set_shape_text(new_title_slide, TITLE_SHAPES["speaker2"],  '')
+    set_shape_text(new_title_slide, TITLE_SHAPES["role2"],     '')
+    
+    for i, slide_info in enumerate(slides_data):
+        s = new_content_slides[i]
+        bullets = slide_info.get('bullets', [])
+        set_shape_text(s, CONTENT_SHAPES["title"],    slide_info.get('title', ''))
+        set_shape_text(s, CONTENT_SHAPES["subtitle"], slide_info.get('subtitle', ''))
+        set_shape_text(s, CONTENT_SHAPES["bullet0"],  bullets[0] if len(bullets) > 0 else '')
+        set_shape_text(s, CONTENT_SHAPES["bullet1"],  bullets[1] if len(bullets) > 1 else '')
+        set_shape_text(s, CONTENT_SHAPES["bullet2"],  bullets[2] if len(bullets) > 2 else '')
+        set_shape_text(s, CONTENT_SHAPES["bullet3"],  bullets[3] if len(bullets) > 3 else '')
+    
+    # Шаг 3: Удаляем исходные 10 слайдов-шаблонов (оставляем только новые)
+    sldIdLst = prs.slides._sldIdLst
+    all_ids = list(sldIdLst)
+    # Первые 10 — шаблонные, удаляем их
+    for sldId in all_ids[:10]:
+        sldIdLst.remove(sldId)
+    
+    prs.save(output_path)
 
 
 @dp.message(CommandStart())
@@ -199,11 +208,23 @@ async def build_presentation(message: Message):
             {"role": "user", "content": transcripts[user_id]}
         ]
     )
-    md_content = response.choices[0].message.content
+
+    raw = response.choices[0].message.content.strip()
+    # Убираем возможные markdown-блоки если GPT всё же добавил
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        await message.answer("❌ GPT вернул некорректный JSON. Попробуй ещё раз.")
+        return
 
     with tempfile.TemporaryDirectory() as tmp:
         pptx_path = f"{tmp}/presentation.pptx"
-        build_pptx(md_content, pptx_path)
+        build_pptx(data, pptx_path)
         await message.answer_document(
             FSInputFile(pptx_path, filename="presentation.pptx"),
             caption="🎉 Готово! Презентация на основе твоих слов."
