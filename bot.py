@@ -39,7 +39,7 @@ LABEL   = "Москва 2026"
 
 # ── Состояние пользователей ────────────────────────────────────────
 # format: "voice" | "audio" | "text"
-# timing: 20 | 30 | 40
+# timing: int (5–120)
 # raw_input: исходный текст (из речи/файла/описания)
 # md_plan: финальный Markdown для PPTX
 state = {}
@@ -90,11 +90,11 @@ SYSTEM_PROMPT_BASE = """
 """
 
 def timing_hint_from_minutes(minutes: int) -> str:
-    if minutes == 20:
-        return "- 20 минут: 8–10 слайдов, 2–3 минуты на слайд, буллеты максимально ёмкие."
-    if minutes == 30:
-        return "- 30 минут: 10–14 слайдов, 2–3 минуты на слайд, можно чуть больше деталей."
-    return "- 40 минут: 14–18 слайдов, больше примеров и расшифровок, но без воды."
+    if minutes <= 20:
+        return f"- {minutes} минут: 8–10 слайдов, ~2 минуты на слайд, буллеты максимально ёмкие."
+    if minutes <= 35:
+        return f"- {minutes} минут: 10–14 слайдов, ~2–3 минуты на слайд, можно чуть больше деталей."
+    return f"- {minutes} минут: 14–18+ слайдов, больше примеров и расшифровок, но без воды."
 
 
 # ── Утилиты стилизации ─────────────────────────────────────────────
@@ -296,53 +296,81 @@ async def choose_format(message: Message):
         st["format"] = "voice"
         await message.answer(
             "Формат: голосовые сообщения.\n"
-            "Теперь выбери тайминг презентации: 20, 30 или 40 минут."
+            "Теперь отправь длительность выступления в минутах (например, 20 или 35)."
         )
     elif message.text == "2":
         st["format"] = "audio"
         await message.answer(
             "Формат: аудиофайл.\n"
-            "Сначала выбери тайминг презентации: 20, 30 или 40 минут.\n"
+            "Сначала отправь длительность выступления в минутах (например, 25).\n"
             "После этого пришли файл (.mp3, .m4a, .wav, .ogg)."
         )
     else:
         st["format"] = "text"
         await message.answer(
             "Формат: текстовое описание.\n"
-            "Выбери тайминг презентации: 20, 30 или 40 минут.\n"
+            "Отправь длительность выступления в минутах (например, 30).\n"
             "После выбора просто пришли текст/описание."
         )
 
 
-@dp.message(F.text.in_(["20", "30", "40"]))
-async def choose_timing(message: Message):
+@dp.message(F.text)
+async def handle_timing_or_commands(message: Message):
     user_id = message.from_user.id
-    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
-    st["timing"] = int(message.text)
+    text = message.text.strip()
 
-    if not st["format"]:
-        await message.answer(
-            "Тайминг сохранён.\nТеперь сначала выбери формат: 1 — голос, 2 — аудиофайл, 3 — текст."
-        )
+    # Служебные команды обрабатываются отдельными хэндлерами ниже
+    if text in ["/plan", "/build", "/start", "1", "2", "3"]:
         return
 
-    if st["format"] == "voice":
-        await message.answer(
-            f"Ок, делаем презентацию на {st['timing']} минут по голосовым.\n\n"
-            "Наговаривай одно или несколько голосовых сообщений.\n"
-            "Когда закончишь — напиши /plan, чтобы я показал структуру."
-        )
-    elif st["format"] == "audio":
-        await message.answer(
-            f"Ок, делаем презентацию на {st['timing']} минут по аудиофайлу.\n\n"
-            "Пришли аудиофайл (mp3/m4a/wav/ogg), потом напиши /plan."
-        )
-    else:
-        await message.answer(
-            f"Ок, делаем презентацию на {st['timing']} минут по тексту.\n\n"
-            "Пришли текст/описание одним или несколькими сообщениями.\n"
-            "Когда будешь готов — напиши /plan."
-        )
+    # Пытаемся распарсить как число (тайминг)
+    if text.isdigit():
+        minutes = int(text)
+        if minutes < 5 or minutes > 120:
+            await message.answer("Введи длительность от 5 до 120 минут (например, 25).")
+            return
+
+        st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+        st["timing"] = minutes
+
+        if not st["format"]:
+            await message.answer(
+                f"Тайминг {minutes} минут сохранён.\n"
+                "Теперь выбери формат: 1 — голос, 2 — аудиофайл, 3 — текст."
+            )
+            return
+
+        if st["format"] == "voice":
+            await message.answer(
+                f"Ок, делаем презентацию на {minutes} минут по голосовым.\n\n"
+                "Наговаривай одно или несколько голосовых.\n"
+                "Когда закончишь — напиши /plan."
+            )
+        elif st["format"] == "audio":
+            await message.answer(
+                f"Ок, делаем презентацию на {minutes} минут по аудиофайлу.\n\n"
+                "Пришли аудиофайл (mp3/m4a/wav/ogg), потом напиши /plan."
+            )
+        else:
+            await message.answer(
+                f"Ок, делаем презентацию на {minutes} минут по тексту.\n\n"
+                "Пришли текст/описание одним или несколькими сообщениями, затем /plan."
+            )
+        return
+
+    # Если не число — считаем текстовым вводом (формат "text")
+    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+    if st.get("format") != "text":
+        return
+    if not st.get("timing"):
+        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
+        return
+
+    st["raw_input"] = (st.get("raw_input") or "") + "\n\n" + text
+    await message.answer(
+        "✍️ Текст добавлен.\n"
+        "Можешь дописать ещё или отправить /plan для предварительной структуры."
+    )
 
 
 # ── Голосовые сообщения ────────────────────────────────────────────
@@ -355,7 +383,7 @@ async def handle_voice(message: Message):
         await message.answer("Сейчас выбран другой формат. Чтобы перейти на голос, отправь /start и выбери 1.")
         return
     if not st.get("timing"):
-        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
         return
 
     await message.answer("⏳ Транскрибирую голос...")
@@ -391,7 +419,7 @@ async def handle_audio_file(message: Message):
         return
 
     if not st.get("timing"):
-        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
         return
 
     telegram_file = message.audio or message.document
@@ -417,25 +445,6 @@ async def handle_audio_file(message: Message):
     )
 
 
-# ── Текстовый ввод ─────────────────────────────────────────────────
-
-@dp.message(F.text & ~F.text.in_(["1", "2", "3", "20", "30", "40", "/plan", "/build"]))
-async def handle_text(message: Message):
-    user_id = message.from_user.id
-    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
-    if st.get("format") != "text":
-        return
-    if not st.get("timing"):
-        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
-        return
-
-    st["raw_input"] = (st.get("raw_input") or "") + "\n\n" + message.text
-    await message.answer(
-        "✍️ Текст добавлен.\n"
-        "Можешь дописать ещё или отправить /plan для предварительной структуры."
-    )
-
-
 # ── Предварительный план ──────────────────────────────────────────
 
 @dp.message(F.text == "/plan")
@@ -446,7 +455,7 @@ async def show_plan(message: Message):
         await message.answer("Мне пока не из чего делать презентацию. Сначала пришли контент.")
         return
     if not st.get("timing"):
-        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
         return
 
     await message.answer("🧩 Собираю структуру и тезисы...")
@@ -484,7 +493,7 @@ async def build_presentation(message: Message):
         await message.answer("Сначала пришли контент (голос, аудио или текст).")
         return
     if not st.get("timing"):
-        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
         return
 
     if not st.get("md_plan"):
