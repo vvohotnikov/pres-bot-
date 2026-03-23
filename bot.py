@@ -236,7 +236,7 @@ async def build_plan_and_markdown(user_id: int):
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": st["raw_input"]}
         ]
-    )  # ← ВОТ ЭТА СКОБКА БЫЛА ПРОПУЩЕНА
+    )
     full = resp.choices[0].message.content.strip()
 
     plan_part = ""
@@ -262,6 +262,7 @@ async def build_plan_and_markdown(user_id: int):
 
 
 # ── Telegram-хэндлеры ─────────────────────────────────────────────-
+# ВАЖНО: команды должны быть зарегистрированы ПЕРЕД общим текстовым хэндлером
 
 @dp.message(CommandStart())
 async def start(message: Message):
@@ -310,63 +311,88 @@ async def choose_format(message: Message):
         )
 
 
-@dp.message(F.text)
-async def handle_timing_or_commands(message: Message):
+# ── Предварительный план (ДОЛЖЕН БЫТЬ ДО ОБЩЕГО ХЭНДЛЕРА) ──────────
+
+@dp.message(F.text == "/plan")
+async def show_plan(message: Message):
     user_id = message.from_user.id
-    text = message.text.strip()
-
-    # Служебные команды обрабатываются отдельными хэндлерами ниже
-    if text in ["/plan", "/build", "/start", "1", "2", "3"]:
-        return
-
-    # Пытаемся распарсить как число (тайминг)
-    if text.isdigit():
-        minutes = int(text)
-        if minutes < 5 or minutes > 120:
-            await message.answer("Введи длительность от 5 до 120 минут (например, 25).")
-            return
-
-        st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
-        st["timing"] = minutes
-
-        if not st["format"]:
-            await message.answer(
-                f"Тайминг {minutes} минут сохранён.\n"
-                "Теперь выбери формат: 1 — голос, 2 — аудиофайл, 3 — текст."
-            )
-            return
-
-        if st["format"] == "voice":
-            await message.answer(
-                f"Ок, делаем презентацию на {minutes} минут по голосовым.\n\n"
-                "Наговаривай одно или несколько голосовых.\n"
-                "Когда закончишь — напиши /plan."
-            )
-        elif st["format"] == "audio":
-            await message.answer(
-                f"Ок, делаем презентацию на {minutes} минут по аудиофайлу.\n\n"
-                "Пришли аудиофайл (mp3/m4a/wav/ogg), потом напиши /plan."
-            )
-        else:
-            await message.answer(
-                f"Ок, делаем презентацию на {minutes} минут по тексту.\n\n"
-                "Пришли текст/описание одним или несколькими сообщениями, затем /plan."
-            )
-        return
-
-    # Если не число — считаем текстовым вводом (формат "text")
-    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
-    if st.get("format") != "text":
+    st = state.get(user_id)
+    if not st or not st.get("raw_input"):
+        await message.answer("Мне пока не из чего делать презентацию. Сначала пришли контент.")
         return
     if not st.get("timing"):
         await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
         return
 
-    st["raw_input"] = (st.get("raw_input") or "") + "\n\n" + text
-    await message.answer(
-        "✍️ Текст добавлен.\n"
-        "Можешь дописать ещё или отправить /plan для предварительной структуры."
-    )
+    await message.answer("🧩 Собираю структуру и тезисы...")
+    
+    try:
+        plan_text, md, slides_plan = await build_plan_and_markdown(user_id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при генерации плана:\n{str(e)}")
+        return
+
+    minutes = st["timing"]
+    total_slides = len(slides_plan) if slides_plan else "?"
+    per_slide = round(minutes / total_slides, 1) if isinstance(total_slides, int) and total_slides > 0 else "≈2–3"
+
+    lines = [
+        f"План презентации на {minutes} минут:",
+        f"Слайдов: {total_slides}, ориентировочно {per_slide} мин на слайд.",
+        ""
+    ]
+    if slides_plan:
+        for idx, title in slides_plan:
+            lines.append(f"{idx}. {title}")
+    else:
+        lines.append(plan_text or "План неявно вшит в Markdown.")
+
+    lines.append("")
+    lines.append("Если структура ок — напиши /build, и я соберу PPTX.")
+    lines.append("Если что-то не так — дополни входной текст и снова вызови /plan.")
+
+    await message.answer("\n".join(lines))
+
+
+# ── Сборка презентации (ТОЖЕ ДО ОБЩЕГО ХЭНДЛЕРА) ──────────────────
+
+@dp.message(F.text == "/build")
+async def build_presentation(message: Message):
+    user_id = message.from_user.id
+    st = state.get(user_id)
+    if not st or not st.get("raw_input"):
+        await message.answer("Сначала пришли контент (голос, аудио или текст).")
+        return
+    if not st.get("timing"):
+        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
+        return
+
+    if not st.get("md_plan"):
+        await message.answer("Сначала делаю структуру...")
+        try:
+            _, _, _ = await build_plan_and_markdown(user_id)
+        except Exception as e:
+            await message.answer(f"❌ Ошибка при генерации структуры:\n{str(e)}")
+            return
+
+    await message.answer("🔨 Собираю презентацию...")
+
+    md_content = st["md_plan"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pptx_path = f"{tmp}/presentation_{st['timing']}min.pptx"
+        build_pptx(md_content, pptx_path)
+        await message.answer_document(
+            FSInputFile(pptx_path, filename=os.path.basename(pptx_path)),
+            caption="🎉 Готово! Презентация на основе твоих материалов."
+        )
+
+    state[user_id] = {
+        "format": st["format"],
+        "timing": st["timing"],
+        "raw_input": "",
+        "md_plan": ""
+    }
 
 
 # ── Голосовые сообщения ────────────────────────────────────────────
@@ -441,79 +467,61 @@ async def handle_audio_file(message: Message):
     )
 
 
-# ── Предварительный план ──────────────────────────────────────────
+# ── ОБЩИЙ ТЕКСТОВЫЙ ХЭНДЛЕР (ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ) ───────────────
 
-@dp.message(F.text == "/plan")
-async def show_plan(message: Message):
+@dp.message(F.text)
+async def handle_timing_or_commands(message: Message):
     user_id = message.from_user.id
-    st = state.get(user_id)
-    if not st or not st.get("raw_input"):
-        await message.answer("Мне пока не из чего делать презентацию. Сначала пришли контент.")
+    text = message.text.strip()
+
+    # Пытаемся распарсить как число (тайминг)
+    if text.isdigit():
+        minutes = int(text)
+        if minutes < 5 or minutes > 120:
+            await message.answer("Введи длительность от 5 до 120 минут (например, 25).")
+            return
+
+        st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+        st["timing"] = minutes
+
+        if not st["format"]:
+            await message.answer(
+                f"Тайминг {minutes} минут сохранён.\n"
+                "Теперь выбери формат: 1 — голос, 2 — аудиофайл, 3 — текст."
+            )
+            return
+
+        if st["format"] == "voice":
+            await message.answer(
+                f"Ок, делаем презентацию на {minutes} минут по голосовым.\n\n"
+                "Наговаривай одно или несколько голосовых.\n"
+                "Когда закончишь — напиши /plan."
+            )
+        elif st["format"] == "audio":
+            await message.answer(
+                f"Ок, делаем презентацию на {minutes} минут по аудиофайлу.\n\n"
+                "Пришли аудиофайл (mp3/m4a/wav/ogg), потом напиши /plan."
+            )
+        else:
+            await message.answer(
+                f"Ок, делаем презентацию на {minutes} минут по тексту.\n\n"
+                "Пришли текст/описание одним или несколькими сообщениями, затем /plan."
+            )
+        return
+
+    # Если не число — считаем текстовым вводом (формат "text")
+    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+    if st.get("format") != "text":
         return
     if not st.get("timing"):
         await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
         return
 
-    await message.answer("🧩 Собираю структуру и тезисы...")
-    plan_text, md, slides_plan = await build_plan_and_markdown(user_id)
-
-    minutes = st["timing"]
-    total_slides = len(slides_plan) if slides_plan else "?"
-    per_slide = round(minutes / total_slides, 1) if isinstance(total_slides, int) and total_slides > 0 else "≈2–3"
-
-    lines = [
-        f"План презентации на {minutes} минут:",
-        f"Слайдов: {total_slides}, ориентировочно {per_slide} мин на слайд.",
-        ""
-    ]
-    if slides_plan:
-        for idx, title in slides_plan:
-            lines.append(f"{idx}. {title}")
-    else:
-        lines.append(plan_text or "План неявно вшит в Markdown.")
-
-    lines.append("")
-    lines.append("Если структура ок — напиши /build, и я соберу PPTX.")
-    lines.append("Если что-то не так — дополни входной текст и снова вызови /plan.")
-
-    await message.answer("\n".join(lines))
-
-
-# ── Сборка презентации ────────────────────────────────────────────
-
-@dp.message(F.text == "/build")
-async def build_presentation(message: Message):
-    user_id = message.from_user.id
-    st = state.get(user_id)
-    if not st or not st.get("raw_input"):
-        await message.answer("Сначала пришли контент (голос, аудио или текст).")
-        return
-    if not st.get("timing"):
-        await message.answer("Сначала задай тайминг: просто отправь количество минут (например, 25).")
-        return
-
-    if not st.get("md_plan"):
-        await message.answer("Сначала делаю структуру...")
-        _, _, _ = await build_plan_and_markdown(user_id)
-
-    await message.answer("🔨 Собираю презентацию...")
-
-    md_content = st["md_plan"]
-
-    with tempfile.TemporaryDirectory() as tmp:
-        pptx_path = f"{tmp}/presentation_{st['timing']}min.pptx"
-        build_pptx(md_content, pptx_path)
-        await message.answer_document(
-            FSInputFile(pptx_path, filename=os.path.basename(pptx_path)),
-            caption="🎉 Готово! Презентация на основе твоих материалов."
-        )
-
-    state[user_id] = {
-        "format": st["format"],
-        "timing": st["timing"],
-        "raw_input": "",
-        "md_plan": ""
-    }
+    st["raw_input"] = (st.get("raw_input") or "") + "\n\n" + text
+    await message.answer(
+        "✍️ Текст добавлен.\n"
+        "Можешь дописать ещё или отправить /plan для предварительной структуры."
+    )
 
 
 async def main():
