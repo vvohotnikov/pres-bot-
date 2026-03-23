@@ -38,10 +38,6 @@ SLIDE_H = Inches(5.625)
 LABEL   = "Москва 2026"
 
 # ── Состояние пользователей ────────────────────────────────────────
-# format: "voice" | "audio" | "text"
-# timing: int (5–120)
-# raw_input: исходный текст (из речи/файла/описания)
-# md_plan: финальный Markdown для PPTX
 state = {}
 
 # ── Системный промт с таймингом и развёрнутыми буллетами ───────────
@@ -240,7 +236,7 @@ async def build_plan_and_markdown(user_id: int):
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": st["raw_input"]}
         ]
-    )
+    )  # ← ВОТ ЭТА СКОБКА БЫЛА ПРОПУЩЕНА
     full = resp.choices[0].message.content.strip()
 
     plan_part = ""
