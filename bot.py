@@ -1,5 +1,5 @@
-# bot.py  |  branch: styled
-import os, asyncio, tempfile
+# bot.py | branch: styled
+import os, asyncio, tempfile, re
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import CommandStart
@@ -21,8 +21,8 @@ client = AsyncOpenAI(
 )
 
 # ── Палитра ────────────────────────────────────────────────────────
-BG_BLACK  = RGBColor(0x00, 0x00, 0x00)   # титул, итоги, перебивки
-BG_LIGHT  = RGBColor(0xEC, 0xF1, 0xF3)   # контентные слайды
+BG_BLACK  = RGBColor(0x00, 0x00, 0x00)  # титул, итоги, перебивки
+BG_LIGHT  = RGBColor(0xEC, 0xF1, 0xF3)  # контентные слайды
 CLR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 CLR_BLACK = RGBColor(0x00, 0x00, 0x00)
 CLR_GRAY  = RGBColor(0x7C, 0x7C, 0x7C)
@@ -37,32 +37,72 @@ SLIDE_W = Inches(10.0)
 SLIDE_H = Inches(5.625)
 LABEL   = "Москва 2026"
 
-# ── Системный промт ────────────────────────────────────────────────
-SYSTEM_PROMPT = """
+# ── Состояние пользователей ────────────────────────────────────────
+# format: "voice" | "audio" | "text"
+# timing: 20 | 30 | 40
+# raw_input: исходный текст (из речи/файла/описания)
+# md_plan: финальный Markdown для PPTX
+state = {}
+
+# ── Системный промт с таймингом и развёрнутыми буллетами ───────────
+
+SYSTEM_PROMPT_BASE = """
 Ты — ассистент для создания презентаций.
-Тебе дают расшифровку голосового сообщения.
-Твоя задача — структурировать его в Markdown-презентацию.
+На вход ты получаешь сырой контент (расшифровка речи или текстовое описание).
+Твоя задача —:
+1) Сначала спланировать структуру презентации под заданный тайминг.
+2) Затем выдать финальную структуру в формате Markdown-презентации.
 
-Правила:
-- Используй ТОЛЬКО то, что сказал пользователь. Не додумывай ничего лишнего.
-- Первый слайд — титульный: # Заголовок + одна строка подзаголовка буллетом
-- Контентные слайды: ## Заголовок раздела + 3-5 коротких буллетов
-- Последний слайд — итоги: ### Ключевые выводы + 3-5 буллетов
-- Максимум 10 слайдов
+Правила структуры:
+- Первый слайд — титульный: # Заголовок + одна строка подзаголовка буллетом.
+- Контентные слайды: ## Заголовок раздела + 3–5 буллетов.
+- Последний слайд — итоги: ### Ключевые выводы + 3–5 буллетов.
+- Каждый буллет — одно полноценное предложение 10–20 слов,
+  которое раскрывает мысль: без телеграфного стиля и обрывков фраз.
+- Старайся распределять материал равномерно по слайдам.
+- Используй ТОЛЬКО то, что сказал пользователь, ничего не придумывай от себя.
 
-Формат вывода — чистый Markdown, ничего лишнего.
+Тайминг:
+{timing_hint}
+
+Формат вывода (строго):
+ПЕРВОЙ частью выведи раздел:
+
+План:
+1. Слайд 1 — ...
+2. Слайд 2 — ...
+...
+
+Затем пустая строка и раздел:
+
+Презентация:
+# Заголовок титульного
+- Подзаголовок как одно предложение
+
+## Заголовок раздела
+- Развёрнутый буллет номер один
+- Развёрнутый буллет номер два
+
+### Ключевые выводы
+- ...
+
+Никаких комментариев до блока «План:» и после блока «Презентация:».
 """
 
-transcripts = {}
+def timing_hint_from_minutes(minutes: int) -> str:
+    if minutes == 20:
+        return "- 20 минут: 8–10 слайдов, 2–3 минуты на слайд, буллеты максимально ёмкие."
+    if minutes == 30:
+        return "- 30 минут: 10–14 слайдов, 2–3 минуты на слайд, можно чуть больше деталей."
+    return "- 40 минут: 14–18 слайдов, больше примеров и расшифровок, но без воды."
 
 
-# ── Утилиты ────────────────────────────────────────────────────────
+# ── Утилиты стилизации ─────────────────────────────────────────────
 
 def set_bg(slide, rgb: RGBColor):
     fill = slide.background.fill
     fill.solid()
     fill.fore_color.rgb = rgb
-
 
 def add_text(slide, text, left, top, width, height,
              size=18, bold=False, color=CLR_WHITE, align=PP_ALIGN.LEFT):
@@ -78,16 +118,13 @@ def add_text(slide, text, left, top, width, height,
     r.font.bold = bold
     r.font.color.rgb = color
 
-
 def add_rect(slide, left, top, width, height, color: RGBColor):
     s = slide.shapes.add_shape(1, left, top, width, height)
     s.fill.solid()
     s.fill.fore_color.rgb = color
     s.line.fill.background()
 
-
 def add_chrome(slide, slide_num: int, dark: bool):
-    """Верхняя шапка: avito.tech + дата + номер слайда."""
     bar_color = RGBColor(0x1A, 0x1A, 0x1A) if dark else RGBColor(0xD8, 0xDE, 0xE1)
     add_rect(slide, Inches(0), Inches(0), SLIDE_W, Inches(0.38), bar_color)
     label_color = CLR_WHITE if dark else CLR_GRAY
@@ -104,48 +141,27 @@ def add_chrome(slide, slide_num: int, dark: bool):
 # ── Три типа слайдов ───────────────────────────────────────────────
 
 def make_dark_slide(prs, title: str, bullets: list, slide_num: int):
-    """
-    Чёрный фон — для титула, перебивок и итогов.
-    Белый крупный заголовок, белые буллеты, оранжевый акцент.
-    """
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     set_bg(slide, BG_BLACK)
     add_chrome(slide, slide_num, dark=True)
-
-    # Оранжевая вертикальная полоска слева
     add_rect(slide, Inches(0), Inches(0.38), Inches(0.06), Inches(5.245), CLR_ORANGE)
-
-    # Заголовок
     add_text(slide, title,
              Inches(0.2), Inches(0.65), Inches(8.5), Inches(1.6),
              size=48, bold=True, color=CLR_WHITE)
-
-    # Буллеты (подзаголовок или тезисы итогов)
     for i, bullet in enumerate(bullets[:5]):
         top = Inches(2.4) + i * Inches(0.6)
         add_text(slide, bullet,
                  Inches(0.2), top, Inches(8.5), Inches(0.55),
                  size=18, bold=False, color=CLR_WHITE)
 
-
 def make_content_slide(prs, title: str, bullets: list, slide_num: int):
-    """
-    Светло-серый фон — для контентных слайдов.
-    Чёрный заголовок, чёрные буллеты, цветные маркеры.
-    """
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     set_bg(slide, BG_LIGHT)
     add_chrome(slide, slide_num, dark=False)
-
-    # Заголовок
     add_text(slide, title,
              Inches(0.22), Inches(0.5), Inches(9.3), Inches(0.85),
              size=32, bold=True, color=CLR_BLACK)
-
-    # Оранжевая линия-разделитель
     add_rect(slide, Inches(0.22), Inches(1.38), Inches(9.1), Inches(0.04), CLR_ORANGE)
-
-    # Буллеты с цветными маркерами
     for i, bullet in enumerate(bullets[:5]):
         top = Inches(1.58) + i * Inches(0.78)
         accent = ACCENT_CYCLE[i % 4]
@@ -155,21 +171,20 @@ def make_content_slide(prs, title: str, bullets: list, slide_num: int):
                  size=16, bold=False, color=CLR_BLACK)
 
 
-# ── Основная функция сборки ────────────────────────────────────────
+# ── Markdown → PPTX ────────────────────────────────────────────────
 
 def build_pptx(md_content: str, output_path: str):
     prs = Presentation()
     prs.slide_width  = SLIDE_W
     prs.slide_height = SLIDE_H
 
-    # Собираем все слайды как список (title, bullets, level)
-    # level: 1 = # (тёмный), 2 = ## (контент), 3 = ### (итоги/тёмный)
     slides = []
     current_title   = None
     current_bullets = []
     current_level   = 1
 
     def flush():
+        nonlocal current_title, current_bullets, current_level
         if current_title is None:
             return
         slides.append({
@@ -200,10 +215,9 @@ def build_pptx(md_content: str, output_path: str):
 
     flush()
 
-    # Рендерим слайды с правильным типом
     for i, s in enumerate(slides):
         num = i + 1
-        is_dark = (s["level"] in (1, 3))  # # и ### → чёрный; ## → серый
+        is_dark = (s["level"] in (1, 3))
         if is_dark:
             make_dark_slide(prs, s["title"], s["bullets"], num)
         else:
@@ -212,23 +226,141 @@ def build_pptx(md_content: str, output_path: str):
     prs.save(output_path)
 
 
-# ── Telegram-хэндлеры ──────────────────────────────────────────────
+# ── GPT: план + Markdown по таймингу ───────────────────────────────
+
+async def build_plan_and_markdown(user_id: int):
+    st = state[user_id]
+    minutes = st["timing"]
+    system_prompt = SYSTEM_PROMPT_BASE.format(
+        timing_hint=timing_hint_from_minutes(minutes)
+    )
+    resp = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": st["raw_input"]}
+        ]
+    )
+    full = resp.choices[0].message.content.strip()
+
+    plan_part = ""
+    md_part   = full
+    if "Презентация:" in full:
+        parts = full.split("Презентация:", 1)
+        plan_part = parts[0].strip()
+        md_part   = parts[1].strip()
+
+    st["md_plan"] = md_part
+
+    slides_plan = []
+    for line in plan_part.splitlines():
+        line = line.strip()
+        m = re.match(r"^(\d+)[\.\)]\s*(.+)$", line)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        title = m.group(2)
+        slides_plan.append((idx, title))
+
+    return plan_part, md_part, slides_plan
+
+
+# ── Telegram-хэндлеры ─────────────────────────────────────────────-
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    user_id = message.from_user.id
+    state[user_id] = {
+        "format": None,
+        "timing": None,
+        "raw_input": "",
+        "md_plan": ""
+    }
     await message.answer(
         "Привет! 🎤\n\n"
-        "Наговори голосовое — я соберу из него презентацию.\n"
-        "Можешь отправить несколько войсов подряд, затем напиши /build"
+        "Я помогу собрать презентацию.\n\n"
+        "Выбери формат ввода:\n"
+        "1 — голосовые сообщения\n"
+        "2 — загрузить аудиофайл\n"
+        "3 — текстовое описание\n\n"
+        "Просто ответь: 1, 2 или 3."
     )
 
+
+@dp.message(F.text.in_(["1", "2", "3"]))
+async def choose_format(message: Message):
+    user_id = message.from_user.id
+    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+
+    if message.text == "1":
+        st["format"] = "voice"
+        await message.answer(
+            "Формат: голосовые сообщения.\n"
+            "Теперь выбери тайминг презентации: 20, 30 или 40 минут."
+        )
+    elif message.text == "2":
+        st["format"] = "audio"
+        await message.answer(
+            "Формат: аудиофайл.\n"
+            "Сначала выбери тайминг презентации: 20, 30 или 40 минут.\n"
+            "После этого пришли файл (.mp3, .m4a, .wav, .ogg)."
+        )
+    else:
+        st["format"] = "text"
+        await message.answer(
+            "Формат: текстовое описание.\n"
+            "Выбери тайминг презентации: 20, 30 или 40 минут.\n"
+            "После выбора просто пришли текст/описание."
+        )
+
+
+@dp.message(F.text.in_(["20", "30", "40"]))
+async def choose_timing(message: Message):
+    user_id = message.from_user.id
+    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+    st["timing"] = int(message.text)
+
+    if not st["format"]:
+        await message.answer(
+            "Тайминг сохранён.\nТеперь сначала выбери формат: 1 — голос, 2 — аудиофайл, 3 — текст."
+        )
+        return
+
+    if st["format"] == "voice":
+        await message.answer(
+            f"Ок, делаем презентацию на {st['timing']} минут по голосовым.\n\n"
+            "Наговаривай одно или несколько голосовых сообщений.\n"
+            "Когда закончишь — напиши /plan, чтобы я показал структуру."
+        )
+    elif st["format"] == "audio":
+        await message.answer(
+            f"Ок, делаем презентацию на {st['timing']} минут по аудиофайлу.\n\n"
+            "Пришли аудиофайл (mp3/m4a/wav/ogg), потом напиши /plan."
+        )
+    else:
+        await message.answer(
+            f"Ок, делаем презентацию на {st['timing']} минут по тексту.\n\n"
+            "Пришли текст/описание одним или несколькими сообщениями.\n"
+            "Когда будешь готов — напиши /plan."
+        )
+
+
+# ── Голосовые сообщения ────────────────────────────────────────────
 
 @dp.message(F.voice)
 async def handle_voice(message: Message):
     user_id = message.from_user.id
-    await message.answer("⏳ Транскрибирую...")
+    st = state.setdefault(user_id, {"format": "voice", "timing": None, "raw_input": "", "md_plan": ""})
+    if st.get("format") != "voice":
+        await message.answer("Сейчас выбран другой формат. Чтобы перейти на голос, отправь /start и выбери 1.")
+        return
+    if not st.get("timing"):
+        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        return
 
+    await message.answer("⏳ Транскрибирую голос...")
     voice_file = await bot.get_file(message.voice.file_id)
+
     with tempfile.TemporaryDirectory() as tmp:
         oga_path = f"{tmp}/voice.oga"
         mp3_path = f"{tmp}/voice.mp3"
@@ -241,41 +373,142 @@ async def handle_voice(message: Message):
             )
 
     text = result.text
-    transcripts[user_id] = transcripts.get(user_id, "") + "\n\n" + text
+    st["raw_input"] = (st.get("raw_input") or "") + "\n\n" + text
     await message.answer(
-        f"✅ Записал:\n\n_{text}_\n\nОтправь ещё войс или /build",
+        f"✅ Записал фрагмент:\n\n_{text}_\n\n"
+        "Наговори ещё или напиши /plan для предварительной структуры.",
         parse_mode="Markdown"
     )
 
 
+# ── Аудиофайлы ─────────────────────────────────────────────────────
+
+@dp.message(F.audio | F.document)
+async def handle_audio_file(message: Message):
+    user_id = message.from_user.id
+    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+    if st.get("format") != "audio":
+        return
+
+    if not st.get("timing"):
+        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        return
+
+    telegram_file = message.audio or message.document
+    await message.answer("⏳ Транскрибирую аудиофайл...")
+
+    file_info = await bot.get_file(telegram_file.file_id)
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = f"{tmp}/input"
+        out_path = f"{tmp}/audio.mp3"
+        await bot.download_file(file_info.file_path, in_path)
+        AudioSegment.from_file(in_path).export(out_path, format="mp3")
+
+        with open(out_path, "rb") as f:
+            result = await client.audio.transcriptions.create(
+                model="whisper-1", file=f, language="ru"
+            )
+
+    text = result.text
+    st["raw_input"] = text
+    await message.answer(
+        "✅ Аудиофайл распознан.\n\n"
+        "Теперь напиши /plan, чтобы я показал структуру слайдов."
+    )
+
+
+# ── Текстовый ввод ─────────────────────────────────────────────────
+
+@dp.message(F.text & ~F.text.in_(["1", "2", "3", "20", "30", "40", "/plan", "/build"]))
+async def handle_text(message: Message):
+    user_id = message.from_user.id
+    st = state.setdefault(user_id, {"format": None, "timing": None, "raw_input": "", "md_plan": ""})
+    if st.get("format") != "text":
+        return
+    if not st.get("timing"):
+        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        return
+
+    st["raw_input"] = (st.get("raw_input") or "") + "\n\n" + message.text
+    await message.answer(
+        "✍️ Текст добавлен.\n"
+        "Можешь дописать ещё или отправить /plan для предварительной структуры."
+    )
+
+
+# ── Предварительный план ──────────────────────────────────────────
+
+@dp.message(F.text == "/plan")
+async def show_plan(message: Message):
+    user_id = message.from_user.id
+    st = state.get(user_id)
+    if not st or not st.get("raw_input"):
+        await message.answer("Мне пока не из чего делать презентацию. Сначала пришли контент.")
+        return
+    if not st.get("timing"):
+        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        return
+
+    await message.answer("🧩 Собираю структуру и тезисы...")
+    plan_text, md, slides_plan = await build_plan_and_markdown(user_id)
+
+    minutes = st["timing"]
+    total_slides = len(slides_plan) if slides_plan else "?"
+    per_slide = round(minutes / total_slides, 1) if isinstance(total_slides, int) and total_slides > 0 else "≈2–3"
+
+    lines = [
+        f"План презентации на {minutes} минут:",
+        f"Слайдов: {total_slides}, ориентировочно {per_slide} мин на слайд.",
+        ""
+    ]
+    if slides_plan:
+        for idx, title in slides_plan:
+            lines.append(f"{idx}. {title}")
+    else:
+        lines.append(plan_text or "План неявно вшит в Markdown.")
+
+    lines.append("")
+    lines.append("Если структура ок — напиши /build, и я соберу PPTX.")
+    lines.append("Если что-то не так — дополни входной текст и снова вызови /plan.")
+
+    await message.answer("\n".join(lines))
+
+
+# ── Сборка презентации ────────────────────────────────────────────
+
 @dp.message(F.text == "/build")
 async def build_presentation(message: Message):
     user_id = message.from_user.id
-    if user_id not in transcripts or not transcripts[user_id].strip():
-        await message.answer("Сначала отправь голосовое сообщение 🎤")
+    st = state.get(user_id)
+    if not st or not st.get("raw_input"):
+        await message.answer("Сначала пришли контент (голос, аудио или текст).")
         return
+    if not st.get("timing"):
+        await message.answer("Сначала выбери тайминг: 20, 30 или 40 минут.")
+        return
+
+    if not st.get("md_plan"):
+        await message.answer("Сначала делаю структуру...")
+        _, _, _ = await build_plan_and_markdown(user_id)
 
     await message.answer("🔨 Собираю презентацию...")
 
-    response = await client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": transcripts[user_id]}
-        ]
-    )
-
-    md_content = response.choices[0].message.content
+    md_content = st["md_plan"]
 
     with tempfile.TemporaryDirectory() as tmp:
-        pptx_path = f"{tmp}/presentation.pptx"
+        pptx_path = f"{tmp}/presentation_{st['timing']}min.pptx"
         build_pptx(md_content, pptx_path)
         await message.answer_document(
-            FSInputFile(pptx_path, filename="presentation.pptx"),
-            caption="🎉 Готово! Презентация на основе твоих слов."
+            FSInputFile(pptx_path, filename=os.path.basename(pptx_path)),
+            caption="🎉 Готово! Презентация на основе твоих материалов."
         )
 
-    del transcripts[user_id]
+    state[user_id] = {
+        "format": st["format"],
+        "timing": st["timing"],
+        "raw_input": "",
+        "md_plan": ""
+    }
 
 
 async def main():
