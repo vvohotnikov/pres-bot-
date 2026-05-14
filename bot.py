@@ -1,3 +1,5 @@
+import time
+time.sleep(7)
 # bot.py | branch: styled
 import os, asyncio, tempfile, re
 from aiogram import Bot, Dispatcher, F
