@@ -6,6 +6,8 @@ meta:
 build:
   requirementsPath: requirements.txt
   useCache: true
+  systemPackages:
+    - ffmpeg
 run:
   scriptName: bot.py
   persistenceMount: /data
